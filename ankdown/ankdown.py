@@ -62,12 +62,13 @@ Options:
     --configFile CONFIG_FILE_PATH path to ankdown configuration as YAML file
 """
 
-
+import glob
 import hashlib
 import os
 import re
 import tempfile
 import textwrap
+import uuid
 
 from shutil import copyfile
 
@@ -150,6 +151,7 @@ CONFIG = {
         {"name": "Question"},
         {"name": "Answer"},
         {"name": "Tags"},
+        {"name": "UUID"},
     ],
     'card_model_templates': [
         {
@@ -173,6 +175,7 @@ class Card(object):
 
     def __init__(self, filename, file_index):
         self.fields = []
+        self.raw_fields = []
         self.filename = filename
         self.file_index = file_index
         self.model = genanki.Model(
@@ -182,6 +185,7 @@ class Card(object):
             templates=CONFIG['card_model_templates'],
             css=CONFIG['card_model_css']
         )
+        self.uuid = None
 
     def deckdir(self):
         return os.path.dirname(self.filename)
@@ -198,22 +202,51 @@ class Card(object):
     def add_field(self, field):
         self.fields.append(field)
 
+    def parse_meta_field(self, meta_lines):
+        if self.uuid is not None:
+            raise ValueError
+
+        for line in meta_lines:
+            if line.strip().startswith('UUID='):
+                self.uuid = line.strip()[5:]
+                self.fields.append(f'UUID={self.uuid}')
+
+    def fill_raw_fields(self):
+        while len(self.raw_fields) < 4:
+            self.raw_fields.append([])
+
+    def add_uuid(self):
+        if self.uuid is None:
+            self.uuid = str(uuid.uuid4())
+            self.raw_fields[-1].append(f'UUID={self.uuid}\n')
+
+            while len(self.fields) < 3:
+                self.fields.append('')
+            self.fields.append(f'UUID={self.uuid}')
+
     def has_data(self):
         return len(self.fields) > 0 and any([s.strip() for s in self.fields])
 
     def has_front_and_back(self):
         return len(self.fields) >= 2
 
+    def has_tags(self):
+        return len(self.fields) >= 3
+
     def finalize(self):
         """Ensure proper shape, for extraction into result formats."""
-        if len(self.fields) > 3:
-            self.fields = self.fields[:3]
+        if len(self.fields) > 4:
+            self.fields = self.fields[:4]
         else:
+            # This is performed in self.add_uuid()
             while len(self.fields) < 3:
                 self.fields.append('')
 
     def guid(self):
-        return simple_hash(self.card_id())
+        if self.uuid is None:
+            raise ValueError
+        return self.uuid
+        # return simple_hash(self.card_id())
 
     def to_genanki_note(self):
         """Produce a genanki.Note with the specified guid."""
@@ -233,7 +266,7 @@ class Card(object):
         """Find all media references in a card"""
         for i, field in enumerate(self.fields):
             current_stage = field
-            for regex in [r'src="([^"]*?)"']: # TODO not sure how this should work:, r'\[sound:(.*?)\]']:
+            for regex in [r'src="([^"]*?)"']:  # , r'\[sound:(.*?)\]']:
                 results = []
 
                 def process_match(m):
@@ -249,6 +282,20 @@ class Card(object):
 
             # Anki seems to hate alt tags :(
             self.fields[i] = re.sub(r'alt="[^"]*?"', '', current_stage)
+
+            for regex in [r'\[sound:(.*?)\]']:
+                results = []
+
+                def process_match(m):
+                    initial_contents = m.group(1)
+                    abspath, newpath = self.make_ref_pair(initial_contents)
+                    results.append((abspath, newpath))
+                    return r'src="' + newpath + '"'
+
+                current_stage = re.sub(regex, process_match, current_stage)
+
+                for r in results:
+                    yield r
 
 
 class DeckCollection(dict):
@@ -275,12 +322,20 @@ def field_to_html(field):
         for bracket in ["(", ")", "[", "]"]:
             field = field.replace(r"\{}".format(bracket), r"\\{}".format(bracket))
             # backslashes, man.
-    
+
     if CONFIG['highlight']:
         return highlight_markdown(field)
 
+    def escape_me(m):
+        return '<sound ' + m.group(1) + '/>'
 
-    return misaka.html(field, extensions=("fenced-code", "math"))
+    def fix_me(m):
+        return '[sound:' + m.group(1) + ']'
+
+    field = re.sub(r'\[sound:(.*?)\]', escape_me, field)
+    field = misaka.html(field, extensions=("fenced-code", "math"))
+    field = re.sub(r'<sound (.*?)/>', fix_me, field)
+    return field
 
 
 def compile_field(field_lines, is_markdown):
@@ -302,10 +357,16 @@ def produce_cards(filename):
             stripped = line.strip()
             if stripped in {"---", "%"}:
                 is_markdown = not current_card.has_front_and_back()
-                field = compile_field(current_field_lines, is_markdown=is_markdown)
-                current_card.add_field(field)
+                if current_card.has_tags():
+                    current_card.parse_meta_field(current_field_lines)
+                else:
+                    field = compile_field(current_field_lines, is_markdown=is_markdown)
+                    current_card.add_field(field)
+                current_card.raw_fields.append(current_field_lines)
                 current_field_lines = []
                 if stripped == "---":
+                    current_card.fill_raw_fields()
+                    current_card.add_uuid()
                     yield current_card
                     i += 1
                     current_card = Card(filename, file_index=i)
@@ -314,10 +375,26 @@ def produce_cards(filename):
 
         if current_field_lines:
             is_markdown = not current_card.has_front_and_back()
-            field = compile_field(current_field_lines, is_markdown=is_markdown)
-            current_card.add_field(field)
+            if current_card.has_tags():
+                current_card.parse_meta_field(current_field_lines)
+            else:
+                field = compile_field(current_field_lines, is_markdown=is_markdown)
+                current_card.add_field(field)
+            current_card.raw_fields.append(current_field_lines)
         if current_card.has_data():
+            current_card.fill_raw_fields()
+            current_card.add_uuid()
             yield current_card
+
+
+def save_cards(cards, output_file):
+
+    with open(output_file, 'w') as f:
+        for i,card in enumerate(cards):
+            assert len(card.raw_fields) == 4
+            f.write('%\n'.join([''.join(field) for field in card.raw_fields]))
+            if i < len(cards) - 1:
+                f.write('---\n')
 
 
 def cards_from_dir(dirname):
@@ -325,7 +402,27 @@ def cards_from_dir(dirname):
     for parent_dir, _, files in os.walk(dirname):
         for fn in files:
             if fn.endswith(".md") or fn.endswith(".markdown"):
-                for card in produce_cards(os.path.join(parent_dir, fn)):
+
+                # Make a backup
+                bak_dir = os.path.join(parent_dir, 'backups')
+                if not os.path.isdir(bak_dir):
+                    os.mkdir(bak_dir)
+
+                old_baks = glob.glob(f'{bak_dir}/{fn}.bak.*')
+                if old_baks:
+                    bak_num = 1 + max(int(re.search('\.bak\.(\d+)', f).group(1)) for f in old_baks)
+                else:
+                    bak_num = 1
+
+                md = os.path.join(parent_dir, fn)
+                bak = os.path.join(bak_dir, f'{fn}.bak.{bak_num}')
+                copyfile(md, bak)
+
+                cards = [card for card in produce_cards(md)]
+
+                save_cards(cards, md)
+
+                for card in cards:
                     yield card
 
 
